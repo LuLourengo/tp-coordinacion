@@ -1,6 +1,6 @@
 import os
 import logging
-import bisect
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,48 +23,84 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.fruits_by_client = {}   
+        self.counted_by_client = {}  
+        self.total_by_client = {}  
 
-    def _process_data(self, fruit, amount):
+    def _process_data(self, client_id, total, count, fruits):
         logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+        client_fruits = self.fruits_by_client.setdefault(client_id, {})
+        for fruit, amount in fruits:
+            client_fruits[fruit] = client_fruits.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self):
-        logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
+        self.counted_by_client[client_id] = (
+            self.counted_by_client.get(client_id, 0) + count
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        self.total_by_client[client_id] = total
+
+        
+        if self.counted_by_client[client_id] == total:
+            self._process_eof(client_id)
+
+    def _process_eof(self, client_id):
+        logging.info("All data received, sending partial top")
+        client_fruits = self.fruits_by_client.pop(client_id, {})
+        del self.counted_by_client[client_id]
+        del self.total_by_client[client_id]
+
+        
+        sorted_fruits = sorted(client_fruits.values(), reverse=True)
+
+        fruit_top = []
+        for item in sorted_fruits[:TOP_SIZE]:
+            fruit_top.append([item.fruit, item.amount])
+
+        self.output_queue.send(
+            message_protocol.internal.serialize([client_id, "DATA", fruit_top])
+        )
+        self.output_queue.send(
+            message_protocol.internal.serialize([client_id, "EOF"])
+        )
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof()
+        if len(fields) == 5 and fields[1] == "DATA":
+            self._process_data(fields[0], fields[2], fields[3], fields[4])
         ack()
 
+    def handle_signal(self, signum, frame):
+        logging.info("Signal received, shutting down")
+        self.input_exchange.stop_consuming()
+
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+        signal.signal(signal.SIGTERM, self.handle_signal)
+        signal.signal(signal.SIGINT, self.handle_signal)
+        try:
+            self.input_exchange.start_consuming(self.process_messsage)
+        finally:
+            self.stop()
+
+    def stop(self):
+        for resource in (self.input_exchange, self.output_queue):
+            try:
+                resource.close()
+            except Exception:
+                logging.exception("Error closing middleware resource")
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
+
+    try:
+        aggregation_filter.start()
+    except Exception:
+        logging.exception("AggregationFilter failed")
+        return 1
+
     return 0
 
 
