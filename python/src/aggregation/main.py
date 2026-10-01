@@ -14,6 +14,9 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 
+MSG_TYPE_DATA = "DATA"
+MSG_TYPE_EOF = "EOF"
+
 class AggregationFilter:
 
     def __init__(self):
@@ -58,16 +61,16 @@ class AggregationFilter:
             fruit_top.append([item.fruit, item.amount])
 
         self.output_queue.send(
-            message_protocol.internal.serialize([client_id, "DATA", fruit_top])
+            message_protocol.internal.serialize([client_id, MSG_TYPE_DATA, fruit_top])
         )
         self.output_queue.send(
-            message_protocol.internal.serialize([client_id, "EOF"])
+            message_protocol.internal.serialize([client_id, MSG_TYPE_EOF])
         )
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 5 and fields[1] == "DATA":
+        if len(fields) == 5 and fields[1] == MSG_TYPE_DATA:
             self._process_data(fields[0], fields[2], fields[3], fields[4])
         ack()
 

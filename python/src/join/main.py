@@ -14,6 +14,9 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 
+MSG_TYPE_DATA = "DATA"
+MSG_TYPE_EOF = "EOF"
+
 class JoinFilter:
 
     def __init__(self):
@@ -58,9 +61,9 @@ class JoinFilter:
             client_id = fields[0]
             msg_type = fields[1]
 
-            if msg_type == "DATA" and len(fields) == 3:
+            if msg_type == MSG_TYPE_DATA and len(fields) == 3:
                 self._process_data(client_id, fields[2])
-            elif msg_type == "EOF":
+            elif msg_type == MSG_TYPE_EOF:
                 self._process_eof(client_id)
         ack()
 

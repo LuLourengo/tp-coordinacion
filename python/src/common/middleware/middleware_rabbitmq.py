@@ -1,6 +1,7 @@
+import contextlib
 import pika
-import random
-import string
+import pika.exceptions
+
 from .middleware import (
     MessageMiddlewareQueue,
     MessageMiddlewareExchange,
@@ -12,157 +13,157 @@ from .middleware import (
 PREFETCH_COUNT = 1
 
 
+"""
+Use un contextmanager (_translate_pika_errors) para centralizar el manejo de excepciones de Pika.
+Para no repetir bloques try/except idénticos en cada método de publicación, consumo y declaración,
+ tal como se corrigio en el tp 1.
+
+"""
+
+@contextlib.contextmanager
+def _translate_pika_errors(action):
+    try:
+        yield
+    except pika.exceptions.AMQPConnectionError as err:
+        raise MessageMiddlewareDisconnectedError(
+            f"Conexion perdida al {action}: {err}"
+        ) from err
+    except pika.exceptions.AMQPError as err:
+        raise MessageMiddlewareMessageError(
+            f"Error al {action}: {err}"
+        ) from err
+
+
 class MessageAcknowledger:
     def __init__(self, channel, delivery_tag):
         self.channel = channel
         self.delivery_tag = delivery_tag
 
     def ack(self):
-        self.channel.basic_ack(delivery_tag=self.delivery_tag)
+        with _translate_pika_errors("hacer ack del mensaje"):
+            self.channel.basic_ack(delivery_tag=self.delivery_tag)
 
     def nack(self):
-        self.channel.basic_nack(delivery_tag=self.delivery_tag, requeue=True)
+        with _translate_pika_errors("hacer nack del mensaje"):
+            self.channel.basic_nack(delivery_tag=self.delivery_tag, requeue=True)
 
 
-class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
+"""
+Cree la clase _RabbitMQMiddleware, como correccion del tp1 por repeticion de codigo.
 
-    def __init__(self, host, queue_name):
+Tanto MessageMiddlewareQueueRabbitMQ como MessageMiddlewareExchangeRabbitMQ compartían implementación:
+establecer la BlockingConnection, abrir el canal, setear el basic_qos(prefetch_count=1), 
+implementar la detención thread-safe con add_callback_threadsafe y manejar los acks en el consumo.
+Extraje la lógica compartida en esta clase y las clases hijas ahora solo se encargan de lo que las diferencia:
+ cómo se declaran las colas en RabbitMQ y si usan o no un exchange con routing keys.
+
+"""
+
+
+class _RabbitMQMiddleware:
+
+    def __init__(self, host):
         self.host = host
-        self.queue_name = queue_name
         self.connection = None
         self.channel = None
-        self.consumer_tag = None
         self.is_consuming = False
         self._user_callback = None
+        self._consume_queues = []
+        self._description = ""
 
-        try:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.host))
+        with _translate_pika_errors(f"conectar con el broker en {host}"):
+            self.connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=self.host)
+            )
             self.channel = self.connection.channel()
             self.channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-            self.channel.queue_declare(queue=self.queue_name)
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.StreamLostError) as err:
-            raise MessageMiddlewareDisconnectedError(
-                f"Fallo de conexion con el broker en {self.host}: {err}"
-            )
-        except (pika.exceptions.AMQPChannelError, Exception) as err:
-            raise MessageMiddlewareMessageError(
-                f"Error al declarar la cola '{self.queue_name}': {err}"
-            )
 
-    def send(self, message):
-        try:
-            self.channel.basic_publish(
-                exchange="",
-                routing_key=self.queue_name,
-                body=message,
-            )
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.ConnectionClosedByBroker, pika.exceptions.StreamLostError) as err:
-            raise MessageMiddlewareDisconnectedError(
-                f"Fallo de conexion al enviar a la cola '{self.queue_name}': {err}"
-            )
-        except (pika.exceptions.AMQPChannelError, pika.exceptions.ChannelClosedByBroker) as err:
-            raise MessageMiddlewareMessageError(
-                f"Canal cerrado al enviar a la cola '{self.queue_name}': {err}"
-            )
-        except Exception as err:
-            raise MessageMiddlewareMessageError(
-                f"Error al enviar mensaje a la cola '{self.queue_name}': {err}"
-            )
+    def _publish(self, exchange, routing_keys, message):
+        with _translate_pika_errors(f"enviar a {self._description}"):
+            for routing_key in routing_keys:
+                self.channel.basic_publish(
+                    exchange=exchange,
+                    routing_key=routing_key,
+                    body=message,
+                )
 
     def _on_message_received(self, channel, method, properties, body):
-        handler = MessageAcknowledger(channel, method.delivery_tag)
-        self._user_callback(body, handler.ack, handler.nack)
+        acknowledger = MessageAcknowledger(channel, method.delivery_tag)
+        self._user_callback(body, acknowledger.ack, acknowledger.nack)
 
     def start_consuming(self, on_message_callback):
         self._user_callback = on_message_callback
-
         try:
-            self.is_consuming = True
-            self.consumer_tag = self.channel.basic_consume(
-                queue=self.queue_name,
-                on_message_callback=self._on_message_received,
-                auto_ack=False,
-            )
-            self.channel.start_consuming()
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.ConnectionClosedByBroker, pika.exceptions.StreamLostError) as err:
+            with _translate_pika_errors(f"consumir de {self._description}"):
+                self.is_consuming = True
+                for queue_name in self._consume_queues:
+                    self.channel.basic_consume(
+                        queue=queue_name,
+                        on_message_callback=self._on_message_received,
+                        auto_ack=False,
+                    )
+                self.channel.start_consuming()
+        finally:
             self.is_consuming = False
-            raise MessageMiddlewareDisconnectedError(
-                f"Conexion perdida durante el consumo en '{self.queue_name}': {err}"
-            )
-        except (pika.exceptions.AMQPChannelError, pika.exceptions.ChannelClosedByBroker) as err:
+
+    def _stop_consuming_callback(self):
+        try:
+            if self.channel and self.channel.is_open:
+                self.channel.stop_consuming()
+        finally:
             self.is_consuming = False
-            raise MessageMiddlewareMessageError(
-                f"Error de canal durante el consumo en '{self.queue_name}': {err}"
-            )
-        except Exception as err:
-            self.is_consuming = False
-            raise err
 
     def stop_consuming(self):
         if not self.is_consuming:
             return
 
-        def _stop():
-    
-            try:
-                if self.channel.is_open:
-                    self.channel.stop_consuming()
-            finally:
-                self.is_consuming = False
-
-        try:
-            
-            self.connection.add_callback_threadsafe(_stop)
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.ConnectionClosedByBroker, pika.exceptions.StreamLostError) as err:
-            raise MessageMiddlewareDisconnectedError(
-                f"Fallo de conexion al detener consumo: {err}"
-            )
+        with _translate_pika_errors("detener el consumo"):
+            self.connection.add_callback_threadsafe(self._stop_consuming_callback)
 
     def close(self):
         try:
-            if self.is_consuming:
-                self.stop_consuming()
-
             if self.channel and self.channel.is_open:
                 self.channel.close()
-
             if self.connection and self.connection.is_open:
                 self.connection.close()
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.StreamLostError):
+        except pika.exceptions.AMQPConnectionError:
             pass
-        except Exception as err:
+        except pika.exceptions.AMQPError as err:
             raise MessageMiddlewareCloseError(
-                f"Error al cerrar la cola '{self.queue_name}': {err}"
-            )
+                f"Error al cerrar {self._description}: {err}"
+            ) from err
 
 
-class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
+class MessageMiddlewareQueueRabbitMQ(_RabbitMQMiddleware, MessageMiddlewareQueue):
+
+    def __init__(self, host, queue_name):
+        super().__init__(host)
+        self.queue_name = queue_name
+        self._description = f"la cola '{queue_name}'"
+        self._consume_queues = [queue_name]
+
+        with _translate_pika_errors(f"declarar {self._description}"):
+            self.channel.queue_declare(queue=self.queue_name)
+
+    def send(self, message):
+        self._publish("", [self.queue_name], message)
+
+
+class MessageMiddlewareExchangeRabbitMQ(
+    _RabbitMQMiddleware, MessageMiddlewareExchange
+):
 
     def __init__(self, host, exchange_name, routing_keys):
-        self.host = host
+        super().__init__(host)
         self.exchange_name = exchange_name
+        self.routing_keys = list(routing_keys or [])
+        self._description = f"el exchange '{exchange_name}'"
 
-        if routing_keys is None:
-            self.routing_keys = []
-        else:
-            self.routing_keys = routing_keys
-
-        self.connection = None
-        self.channel = None
-        self.queue_names = []
-        self.consumer_tag = None
-        self.is_consuming = False
-        self._user_callback = None
-
-        try:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.host))
-            self.channel = self.connection.channel()
-            self.channel.basic_qos(prefetch_count=PREFETCH_COUNT)
+        with _translate_pika_errors(f"declarar {self._description}"):
             self.channel.exchange_declare(
                 exchange=self.exchange_name,
                 exchange_type="direct",
             )
-            
             for routing_key in self.routing_keys:
                 queue_name = f"{self.exchange_name}_{routing_key}"
                 self.channel.queue_declare(queue=queue_name)
@@ -171,100 +172,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                     queue=queue_name,
                     routing_key=routing_key,
                 )
-                self.queue_names.append(queue_name)
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.StreamLostError) as err:
-            raise MessageMiddlewareDisconnectedError(
-                f"Fallo de conexion con el broker en {self.host}: {err}"
-            )
-        except (pika.exceptions.AMQPChannelError, Exception) as err:
-            raise MessageMiddlewareMessageError(
-                f"Error al declarar el exchange '{self.exchange_name}': {err}"
-            )
+                self._consume_queues.append(queue_name)
 
     def send(self, message):
-        try:
-            for routing_key in self.routing_keys:
-                self.channel.basic_publish(
-                    exchange=self.exchange_name,
-                    routing_key=routing_key,
-                    body=message,
-                )
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.ConnectionClosedByBroker, pika.exceptions.StreamLostError) as err:
-            raise MessageMiddlewareDisconnectedError(
-                f"Fallo de conexion al publicar en '{self.exchange_name}': {err}"
-            )
-        except (pika.exceptions.AMQPChannelError, pika.exceptions.ChannelClosedByBroker) as err:
-            raise MessageMiddlewareMessageError(
-                f"Canal cerrado al publicar en '{self.exchange_name}': {err}"
-            )
-        except Exception as err:
-            raise MessageMiddlewareMessageError(
-                f"Error al publicar en '{self.exchange_name}': {err}"
-            )
-
-    def _on_message_received(self, channel, method, properties, body):
-        handler = MessageAcknowledger(channel, method.delivery_tag)
-        self._user_callback(body, handler.ack, handler.nack)
-
-    def start_consuming(self, on_message_callback):
-        self._user_callback = on_message_callback
-
-        try:
-            self.is_consuming = True
-            for queue_name in self.queue_names:
-                self.consumer_tag = self.channel.basic_consume(
-                    queue=queue_name,
-                    on_message_callback=self._on_message_received,
-                    auto_ack=False,
-                )
-            self.channel.start_consuming()
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.ConnectionClosedByBroker, pika.exceptions.StreamLostError) as err:
-            self.is_consuming = False
-            raise MessageMiddlewareDisconnectedError(
-                f"Conexion perdida consumiendo exchange '{self.exchange_name}': {err}"
-            )
-        except (pika.exceptions.AMQPChannelError, pika.exceptions.ChannelClosedByBroker) as err:
-            self.is_consuming = False
-            raise MessageMiddlewareMessageError(
-                f"Error de canal consumiendo exchange '{self.exchange_name}': {err}"
-            )
-        except Exception as err:
-            self.is_consuming = False
-            raise err
-
-    def stop_consuming(self):
-        if not self.is_consuming:
-            return
-
-        def _stop():
-            
-            try:
-                if self.channel.is_open:
-                    self.channel.stop_consuming()
-            finally:
-                self.is_consuming = False
-
-        try:
-            
-            self.connection.add_callback_threadsafe(_stop)
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.ConnectionClosedByBroker, pika.exceptions.StreamLostError) as err:
-            raise MessageMiddlewareDisconnectedError(
-                f"Fallo de conexion al detener consumo del exchange: {err}"
-            )
-
-    def close(self):
-        try:
-            if self.is_consuming:
-                self.stop_consuming()
-
-            if self.channel and self.channel.is_open:
-                self.channel.close()
-
-            if self.connection and self.connection.is_open:
-                self.connection.close()
-        except (pika.exceptions.AMQPConnectionError, pika.exceptions.StreamLostError):
-            pass
-        except Exception as err:
-            raise MessageMiddlewareCloseError(
-                f"Error al cerrar exchange '{self.exchange_name}': {err}"
-            )
+        self._publish(self.exchange_name, self.routing_keys, message)

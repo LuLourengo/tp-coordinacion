@@ -15,6 +15,8 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+MSG_TYPE_DATA = "DATA"
+MSG_TYPE_EOF = "EOF"
 
 class SumFilter:
     def __init__(self):
@@ -75,7 +77,7 @@ class SumFilter:
         for shard, exchange in zip(shards, output_exchanges):
             exchange.send(
                 message_protocol.internal.serialize(
-                    [client_id, "DATA", total, count, shard]
+                    [client_id, MSG_TYPE_DATA, total, count, shard]
                 )
             )
 
@@ -108,9 +110,9 @@ class SumFilter:
         fields = message_protocol.internal.deserialize(message)
         if len(fields) >= 2:
             msg_type = fields[1]
-            if msg_type == "DATA" and len(fields) == 4:
+            if msg_type == MSG_TYPE_DATA and len(fields) == 4:
                 self._process_data(fields[0], fields[2], fields[3])
-            elif msg_type == "EOF" and len(fields) == 3:
+            elif msg_type == MSG_TYPE_EOF and len(fields) == 3:
                 self._notify_eof(fields)
         ack()
 
@@ -125,7 +127,7 @@ class SumFilter:
 
     def process_control_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3 and fields[1] == "EOF":
+        if len(fields) == 3 and fields[1] == MSG_TYPE_EOF:
             self._process_eof(fields[0], fields[2])
         ack()
 
