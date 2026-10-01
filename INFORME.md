@@ -41,14 +41,16 @@ A nivel implementación, cada réplica corre dos threads: uno escuchando la cola
 Cambios realizados:
 
 - Agregue **`prefetch_count = 1`** en ambos constructores. Sin esto, RabbitMQ puede entregar casi todos los mensajes al primer consumidor y las demás réplicas quedan ociosas.
-
+- **Clase base común (`_RabbitMQMiddleware`):** Tanto `MessageMiddlewareQueueRabbitMQ` como `MessageMiddlewareExchangeRabbitMQ` compartían gran parte de su lógica: abrir la conexión con `BlockingConnection`, crear el canal, configurar el QoS, detener el consumo de forma segura con `add_callback_threadsafe` y despachar los acks. Extraje toda esa lógica repetidatal como me indicaron en las correcciones del tp1, a una clase base, dejando en las clases hijas únicamente la declaración puntual(colas directas o exchanges con sus bindings).
+- **Traducción centralizada de errores (`_translate_pika_errors`):** Implementé un context manager con `@contextlib.contextmanager` para no duplicar bloques `try/except` idénticos en cada llamada a RabbitMQ. Al envolver las operaciones con este manejador, cualquier fallo se atrapa y se relanza como una excepción propia de la interfaz (`MessageMiddlewareDisconnectedError` o `MessageMiddlewareMessageError`).
+- **Manejo de errores en confirmaciones (`ack` y `nack`):** En `MessageAcknowledger`, tanto `ack()` como `nack()` quedaron cubiertos por el context manager para capturar posibles caídas de conexión durante la confirmación de mensajes.
 - **Colas del exchange declaradas en el constructor**: En el exchange direct, si  se publica a una routing key que todavía no tiene una cola atada, RabbitMQ descarta el mensaje silenciosamente. En el tp anterior, las colas se creaban recién en `start_consuming()`, así que si un Sum arrancaba a pasar datos antes de que Aggregation se conectara, se perdían mensajes. Lo modifiqué haciendo el `queue_declare` y el `queue_bind` de todas las claves en el `__init__`. 
 
 - **Cierre limpio entre hilos:** Para poder frenar el consumo desde los handlers de `SIGTERM` o entre threads sin romper los sockets, implemente el `stop_consuming` usando `add_callback_threadsafe`. Además, cada hilo usa su propia instancia de middleware y el `close()` se llama una vez que el loop de consumo haya salido.
 
 ## 5. Análisis de escalabilidad
 
-**Respecto a los clientes.**
+**Respecto a los clientes.** 
 Todo el estado está indexado por `client_id`, así que los clientes concurrentes no interfieren entre sí y no hay ningún punto que serialice clientes. Varios clientes pueden mandar datos a la vez intercalándose en las colas sin bloquearse ni mezclarse. 
 
 **Respecto a grandes volúmenes de datos.**
